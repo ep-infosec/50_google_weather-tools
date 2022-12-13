@@ -1,0 +1,283 @@
+# Copyright 2021 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Client interface for connecting to a manifest."""
+
+import abc
+import collections
+import dataclasses
+import json
+import logging
+import os
+import threading
+import time
+import traceback
+import typing as t
+
+from apache_beam.io.gcp import gcsio
+from urllib.parse import urlparse
+
+"""An implementation-dependent Manifest URI."""
+Location = t.NewType('Location', str)
+
+logger = logging.getLogger(__name__)
+
+
+class ManifestException(Exception):
+    """Errors that occur in Manifest Clients."""
+    pass
+
+
+class DownloadStatus(t.NamedTuple):
+    """Data recorded in `Manifest`s reflecting the status of a download."""
+
+    """Copy of selection section of the configuration."""
+    selection: t.Dict
+
+    """Location of the downloaded data."""
+    location: str
+
+    """Download status: 'scheduled', 'in-progress', 'success', or 'failure'."""
+    status: str
+
+    """Cause of error"""
+    error: t.Optional[str]
+
+    """Identifier for the user running the download."""
+    user: str
+
+    """Time in milliseconds since epoch of when download was scheduled."""
+    download_scheduled_time: t.Optional[int]
+
+    """Time in milliseconds since epoch."""
+    download_finished_time: t.Optional[int]
+
+    """Duration in milliseconds."""
+    download_duration: t.Optional[int]
+
+
+@dataclasses.dataclass
+class Manifest(abc.ABC):
+    """Abstract manifest of download statuses.
+
+    Update download statuses to some storage medium.
+
+    This class lets one indicate that a download is `scheduled` or in a transaction process.
+    In the event of a transaction, a download will be updated with an `in-progress`, `success`
+    or `failure` status (with accompanying metadata).
+
+    Example:
+        ```
+        my_manifest = parse_manifest_location(Location('fs://some-firestore-collection'))
+
+        # Schedule data for download
+        my_manifest.schedule({'some': 'metadata'}, 'path/to/downloaded/file', 'my-username')
+
+        # ...
+
+        # Initiate a transaction – it will record that the download is `in-progess`
+        with my_manifest.transact({'some': 'metadata'}, 'path/to/downloaded/file', 'my-username') as tx:
+            # download logic here
+            pass
+
+            # ...
+
+            # on error, will record the download as a `failure` before propagating the error.  By default, it will
+            # record download as a `success`.
+        ```
+
+    Attributes:
+        location: An implementation-specific manifest URI.
+        status: The current `DownloadStatus` of the Manifest.
+    """
+
+    location: Location
+    status: t.Optional[DownloadStatus] = None
+
+    def __post_init__(self):
+        """Initialize the manifest."""
+        self.start = 0
+        self.scheduled_times = {}
+
+    def schedule(self, selection: t.Dict, location: str, user: str) -> None:
+        """Indicate that a job has been scheduled for download.
+
+        'scheduled' jobs occur before 'in-progress', 'success' or 'finished'.
+        """
+        scheduled_time = int(time.time())
+        self.scheduled_times[location] = scheduled_time
+        self._update(
+            DownloadStatus(
+                selection=selection,
+                location=location,
+                user=user,
+                status='scheduled',
+                error=None,
+                download_scheduled_time=scheduled_time,
+                download_finished_time=None,
+                download_duration=None
+            )
+        )
+
+    def _set_for_transaction(self, selection: t.Dict, location: str, user: str) -> None:
+        """Reset Manifest state in preparation for a new transaction."""
+        self.start = 0
+        self.status = DownloadStatus(
+            selection=selection,
+            location=location,
+            user=user,
+            status='in-progress',
+            error=None,
+            download_scheduled_time=self.scheduled_times.pop(location, None),
+            download_finished_time=None,
+            download_duration=None
+        )
+
+    def __enter__(self) -> None:
+        """Record 'in-progress' status of a transaction."""
+        self.start = time.time()
+        self._update(self.status)
+
+    def __exit__(self, exc_type, exc_inst, exc_tb) -> None:
+        """Record end status of a transaction as either 'success' or 'failure'."""
+        end = time.time()
+        if exc_type is None:
+            status = 'success'
+            error = None
+        else:
+            status = 'failure'
+            # For explanation, see https://docs.python.org/3/library/traceback.html#traceback.format_exception
+            error = '\n'.join(traceback.format_exception(exc_type, exc_inst, exc_tb))
+
+        self.status = DownloadStatus(
+            selection=self.status.selection,
+            location=self.status.location,
+            user=self.status.user,
+            status=status,
+            error=error,
+            download_scheduled_time=self.status.download_scheduled_time,
+            download_finished_time=int(end),
+            download_duration=int(end - self.start)
+        )
+        self._update(self.status)
+
+    def transact(self, selection: t.Dict, location: str, user: str) -> 'Manifest':
+        """Create a download transaction."""
+        self._set_for_transaction(selection, location, user)
+        return self
+
+    @abc.abstractmethod
+    def _update(self, download_status: DownloadStatus) -> None:
+        pass
+
+
+class ConsoleManifest(Manifest):
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.name = urlparse(self.location).hostname
+
+    def _update(self, download_status: DownloadStatus) -> None:
+        logger.info(f'[{self.name}] {download_status._asdict()!r}')
+
+
+class GCSManifest(Manifest):
+    """Writes a JSON representation of the manifest to GCS.
+
+    This is an append-only implementation, the latest value in the manifest
+    represents the current state of a download.
+    """
+
+    # Ensure no race conditions occurs on appends to objects in GCS
+    # (i.e. JSON manifests).
+    _lock = threading.Lock()
+
+    def _update(self, download_status: DownloadStatus) -> None:
+        """Writes the JSON data to a manifest."""
+        with GCSManifest._lock:
+            with gcsio.GcsIO().open(self.location, 'a') as gcs_file:
+                json.dump(download_status._asdict(), gcs_file)
+        logger.debug('Manifest written to.')
+        logger.debug(download_status)
+
+
+class LocalManifest(Manifest):
+    """Writes a JSON representation of the manifest to local file."""
+
+    _lock = threading.Lock()
+
+    def __init__(self, location: Location) -> None:
+        super().__init__(Location('{}{}manifest.json'.format(location, os.sep)))
+        if location and not os.path.exists(location):
+            os.makedirs(location)
+
+        # If the file is empty, it should start out as an empty JSON object.
+        if not os.path.exists(self.location) or os.path.getsize(self.location) == 0:
+            with open(self.location, 'w') as file:
+                json.dump({}, file)
+
+    def _update(self, download_status: DownloadStatus) -> None:
+        """Writes the JSON data to a manifest."""
+        assert os.path.exists(self.location), f'{self.location} must exist!'
+        with LocalManifest._lock:
+            with open(self.location, 'r') as file:
+                manifest = json.load(file)
+
+            status = download_status._asdict()
+            manifest[status['location']] = status
+
+            with open(self.location, 'w') as file:
+                json.dump(manifest, file)
+                logger.debug('Manifest written to.')
+                logger.debug(download_status)
+
+
+class MockManifest(Manifest):
+    """In-memory mock manifest."""
+
+    def __init__(self, location: Location) -> None:
+        super().__init__(location)
+        self.records = {}
+
+    def _update(self, download_status: DownloadStatus) -> None:
+        self.records.update({download_status.location: download_status})
+        logger.debug('Manifest updated.')
+        logger.debug(download_status)
+
+
+class NoOpManifest(Manifest):
+    """A manifest that performs no operations."""
+
+    def _update(self, download_status: DownloadStatus) -> None:
+        pass
+
+
+"""Exposed manifest implementations.
+
+Users can choose their preferred manifest implementation by via the protocol of the Manifest Location.
+The protocol corresponds to the keys of this ordered dictionary.
+
+If no protocol is specified, we assume the user wants to write to the local file system.
+If no key is found, the `NoOpManifest` option will be chosen. See `parsers:parse_manifest_location`.
+"""
+MANIFESTS = collections.OrderedDict({
+    'cli': ConsoleManifest,
+    'gs': GCSManifest,
+    '': LocalManifest,
+})
+
+if __name__ == '__main__':
+    # Execute doc tests
+    import doctest
+
+    doctest.testmod()
